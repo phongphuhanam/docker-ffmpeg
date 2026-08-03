@@ -451,13 +451,37 @@ RUN \
   cp -a /usr/local/etc/fonts/* /buildout/usr/local/etc/fonts/ && \
   cp -a /usr/local/lib/lib*so* /buildout/usr/local/lib/ && \
   cp -a /usr/local/lib/aarch64-linux-gnu/lib*so* /buildout/usr/local/lib/aarch64-linux-gnu/ && \
-  cp -a /usr/lib/aarch64-linux-gnu/tegra/lib*so* /buildout/usr/lib/aarch64-linux-gnu/tegra/ && \
   cp -a /usr/share/fonts/* /buildout/usr/share/fonts/
+# Deliberately NOT bundling /usr/lib/aarch64-linux-gnu/tegra/*.so here: those
+# are proprietary Tegra libs (libcuda, libnvbufsurface, libnvjpeg, ...) that
+# nvidia-container-runtime's own CSV-driven injection (host-files-for-
+# container.d/l4t.csv) bind-mounts into that exact path at container start
+# when NVIDIA_VISIBLE_DEVICES/NVIDIA_DRIVER_CAPABILITIES are set - which is
+# required regardless for the EGL vendor config and device nodes nvmpi needs.
+# Bundling our own copies at the same path causes dpkg to fail installing
+# over the runtime's bind-mounted files ("Invalid cross-device link"), and
+# is redundant: the runtime already supplies them. The empty tegra/ directory
+# below just needs to exist as a mount point.
+
+# Build a .deb from the same /buildout tree the runtime stage below copies
+# from, so it's installable directly into an existing container (e.g. drop
+# it into jellyfin's own image via a custom-init script) instead of having
+# to swap the whole base image or hand-mount files.
+COPY debian-pkg/control /buildout/DEBIAN/control
+COPY debian-pkg/postinst /buildout/DEBIAN/postinst
+RUN \
+  echo "**** packaging as .deb ****" && \
+  mkdir -p /buildout/etc/ld.so.conf.d && \
+  echo "/usr/lib/aarch64-linux-gnu/tegra" > /buildout/etc/ld.so.conf.d/jellyfin-ffmpeg-nvmpi.conf && \
+  chmod 755 /buildout/DEBIAN/postinst && \
+  dpkg-deb --build --root-owner-group /buildout /jellyfin-ffmpeg-nvmpi_7.1-nvmpi_arm64.deb && \
+  rm -rf /buildout/DEBIAN /buildout/etc
 
 # runtime stage
 FROM ghcr.io/linuxserver/baseimage-ubuntu:arm64v8-focal
 
 COPY --from=buildstage /buildout/ /
+COPY --from=buildstage /jellyfin-ffmpeg-nvmpi_7.1-nvmpi_arm64.deb /root/
 
 # The Tegra libs baked in under /usr/lib/aarch64-linux-gnu/tegra aren't on
 # the default dynamic linker search path (that's not a path ldconfig scans
