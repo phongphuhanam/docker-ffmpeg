@@ -1,0 +1,501 @@
+# syntax=docker/dockerfile:1
+#
+# Jetson/Tegra variant of docker-ffmpeg: adds jetson-ffmpeg's nvmpi
+# encoders/decoders (h264_nvmpi, hevc_nvmpi, ...) driving the Tegra
+# NVENC/NVDEC hardware blocks via the L4T Multimedia API, on top of the
+# same third-party codec library set jellyfin-ffmpeg builds against.
+#
+# The Jetson Multimedia API sample sources and libnvbuf_utils.so/libnvv4l2.so
+# are host/L4T-BSP-specific (tied to this exact L4T release) and are not
+# available from any public package repo, so they must be present in the
+# build context under jetson-mmapi/ before building this image. See
+# scripts/prepare-jetson-mmapi.sh in this repo for how that's populated.
+
+# build stage
+# Focal (20.04), not Noble: L4T R35.2.1's own jetson_multimedia_api vendor
+# headers (v4l2_nv_extensions.h) redefine several V4L2 H.264 structs that
+# Noble's newer kernel headers (linux/v4l2-controls.h) already declare,
+# causing a hard redefinition conflict. Focal predates that upstreaming.
+FROM ghcr.io/linuxserver/baseimage-ubuntu:arm64v8-focal AS buildstage
+
+ARG FFMPEG_VERSION
+
+ENV \
+  DEBIAN_FRONTEND="noninteractive" \
+  MAKEFLAGS="-j4" \
+  CMAKE_POLICY_VERSION_MINIMUM="3.5"
+
+# versions - trimmed to what jellyfin-ffmpeg actually enables, plus nvmpi.
+# (dropped vs upstream docker-ffmpeg: aom, kvazaar, vvenc, xvid, openjpeg,
+#  opencore-amr, rav1e/rust toolchain, rist, soxr, srt, vidstab, zmq, liblc3,
+#  vmaf - none of these are in jellyfin-ffmpeg's configure line)
+ENV \
+  FDKAAC=2.0.3 \
+  FFMPEG_HARD=release/7.1 \
+  FONTCONFIG=2.16.0 \
+  FREETYPE=2.14.3 \
+  FRIBIDI=1.0.16 \
+  HARFBUZZ=14.2.1 \
+  LAME=3.100 \
+  LIBASS=0.17.5 \
+  LIBDAV1D=1.5.3 \
+  LIBDRM=2.4.134 \
+  OGG=1.3.6 \
+  OPUS=1.6 \
+  SVTAV1=4.1.0 \
+  THEORA=1.2.0 \
+  VORBIS=1.3.7 \
+  VPX=1.16.0 \
+  WEBP=1.6.0 \
+  X265=4.2 \
+  ZIMG=3.0.6
+
+RUN \
+  echo "**** install build packages ****" && \
+  apt-get update && \
+  apt-get install -y \
+    autoconf \
+    automake \
+    build-essential \
+    bzip2 \
+    cmake \
+    diffutils \
+    g++ \
+    gcc \
+    git \
+    gperf \
+    libasound2-dev \
+    libcairo2-dev \
+    libexpat1-dev \
+    libglib2.0-dev \
+    libgomp1 \
+    libharfbuzz-dev \
+    libpciaccess-dev \
+    libssl-dev \
+    libtool \
+    libv4l-dev \
+    libx11-dev \
+    libxext-dev \
+    libxml2-dev \
+    make \
+    nasm \
+    perl \
+    pkg-config \
+    python3-venv \
+    x11proto-xext-dev \
+    xxd \
+    yasm \
+    zlib1g-dev && \
+  python3 -m venv /lsiopy && \
+  /lsiopy/bin/pip install -U --no-cache-dir \
+    pip \
+    setuptools \
+    wheel && \
+  /lsiopy/bin/pip install --no-cache-dir meson ninja && \
+  ln -sf /lsiopy/bin/meson /usr/local/bin/meson && \
+  ln -sf /lsiopy/bin/ninja /usr/local/bin/ninja
+
+# compile 3rd party libs (same recipes as upstream docker-ffmpeg, trimmed set)
+RUN \
+  echo "**** grabbing fdk-aac ****" && \
+  mkdir -p /tmp/fdk-aac && \
+  curl -Lf \
+    https://github.com/mstorsjo/fdk-aac/archive/v${FDKAAC}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/fdk-aac
+RUN \
+  echo "**** compiling fdk-aac ****" && \
+  cd /tmp/fdk-aac && \
+  autoreconf -fiv && \
+  ./configure --disable-static --enable-shared && \
+  make && make install && \
+  strip -d /usr/local/lib/libfdk-aac.so
+RUN \
+  echo "**** grabbing freetype ****" && \
+  mkdir -p /tmp/freetype && \
+  curl -Lf \
+    https://downloads.sourceforge.net/project/freetype/freetype2/${FREETYPE}/freetype-${FREETYPE}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/freetype
+RUN \
+  echo "**** compiling freetype ****" && \
+  cd /tmp/freetype && \
+  ./configure --disable-static --enable-shared && \
+  make && make install && \
+  strip -d /usr/local/lib/libfreetype.so && \
+  echo "**** removing conflicting system libfreetype6 (apt dependency of libcairo2-dev etc.) ****" && \
+  echo "**** it shares libfreetype.so.6's soname with our newer build but lacks its symbols (e.g. FT_Get_Color_Glyph_Paint), which breaks harfbuzz/libass linking against whichever copy the linker happens to resolve first ****" && \
+  dpkg -L libfreetype6:arm64 2>/dev/null | grep '\.so' | xargs -r rm -f && \
+  ldconfig
+RUN \
+  echo "**** grabbing fontconfig ****" && \
+  mkdir -p /tmp/fontconfig && \
+  curl -Lf \
+    https://www.freedesktop.org/software/fontconfig/release/fontconfig-${FONTCONFIG}.tar.xz | \
+    tar -xJ --strip-components=1 -C /tmp/fontconfig
+RUN \
+  echo "**** compiling fontconfig ****" && \
+  cd /tmp/fontconfig && \
+  ./configure --disable-static --enable-shared && \
+  make && make install && \
+  strip -d /usr/local/lib/libfontconfig.so
+RUN \
+  echo "**** grabbing fribidi ****" && \
+  mkdir -p /tmp/fribidi && \
+  curl -Lf \
+    https://github.com/fribidi/fribidi/archive/v${FRIBIDI}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/fribidi
+RUN \
+  echo "**** compiling fribidi ****" && \
+  cd /tmp/fribidi && \
+  ./autogen.sh && \
+  ./configure --disable-static --enable-shared && \
+  make -j 1 && make install && \
+  strip -d /usr/local/lib/libfribidi.so
+RUN \
+  echo "**** grabbing harfbuzz ****" && \
+  mkdir -p /tmp/harfbuzz && \
+  curl -Lf \
+    https://github.com/harfbuzz/harfbuzz/archive/${HARFBUZZ}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/harfbuzz
+RUN \
+  echo "**** compiling harfbuzz ****" && \
+  cd /tmp/harfbuzz && \
+  meson build && \
+  ninja -C build install && \
+  strip -d /usr/local/lib/aarch64-linux-gnu/libharfbuzz*.so
+RUN \
+  echo "**** grabbing lame ****" && \
+  mkdir -p /tmp/lame && \
+  curl -Lf \
+    http://downloads.sourceforge.net/project/lame/lame/${LAME}/lame-${LAME}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/lame
+RUN \
+  echo "**** compiling lame ****" && \
+  cd /tmp/lame && \
+  cp /usr/share/automake-1.16/config.guess config.guess && \
+  cp /usr/share/automake-1.16/config.sub config.sub && \
+  ./configure \
+    --disable-frontend --disable-static \
+    --enable-nasm --enable-shared && \
+  make && make install
+RUN \
+  echo "**** grabbing libass ****" && \
+  mkdir -p /tmp/libass && \
+  curl -Lf \
+    https://github.com/libass/libass/archive/${LIBASS}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/libass
+RUN \
+  echo "**** compiling libass ****" && \
+  cd /tmp/libass && \
+  ./autogen.sh && \
+  ./configure --disable-static --enable-shared && \
+  make && make install && \
+  strip -d /usr/local/lib/libass.so
+RUN \
+  echo "**** grabbing libdav1d ****" && \
+  mkdir -p /tmp/libdav1d && \
+  git clone --branch ${LIBDAV1D} https://code.videolan.org/videolan/dav1d /tmp/libdav1d
+RUN \
+  echo "**** compiling libdav1d ****" && \
+  mkdir -p /tmp/libdav1d/build && \
+  cd /tmp/libdav1d/build && \
+  meson setup .. && \
+  ninja install
+RUN \
+  echo "**** grabbing libdrm ****" && \
+  mkdir -p /tmp/libdrm && \
+  curl -Lf \
+    https://dri.freedesktop.org/libdrm/libdrm-${LIBDRM}.tar.xz | \
+    tar -xJ --strip-components=1 -C /tmp/libdrm
+RUN \
+  echo "**** compiling libdrm ****" && \
+  cd /tmp/libdrm && \
+  meson setup \
+    --prefix=/usr --libdir=/usr/local/lib/aarch64-linux-gnu \
+    -Dvalgrind=disabled . build && \
+  ninja -C build && ninja -C build install && \
+  strip -d /usr/local/lib/aarch64-linux-gnu/libdrm*.so
+RUN \
+  echo "**** grabbing ogg ****" && \
+  mkdir -p /tmp/ogg && \
+  curl -Lf \
+    http://downloads.xiph.org/releases/ogg/libogg-${OGG}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/ogg
+RUN \
+  echo "**** compiling ogg ****" && \
+  cd /tmp/ogg && \
+  ./configure --disable-static --enable-shared && \
+  make && make install
+RUN \
+  echo "**** grabbing opus ****" && \
+  mkdir -p /tmp/opus && \
+  curl -Lf \
+    https://downloads.xiph.org/releases/opus/opus-${OPUS}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/opus
+RUN \
+  echo "**** compiling opus ****" && \
+  cd /tmp/opus && \
+  autoreconf -fiv && \
+  ./configure --disable-static --enable-shared && \
+  make && make install && \
+  strip -d /usr/local/lib/libopus.so
+RUN \
+  echo "**** grabbing SVT-AV1 ****" && \
+  mkdir -p /tmp/svt-av1 && \
+  curl -Lf \
+    https://gitlab.com/AOMediaCodec/SVT-AV1/-/archive/v${SVTAV1}/SVT-AV1-v${SVTAV1}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/svt-av1
+RUN \
+  echo "**** compiling SVT-AV1 ****" && \
+  cd /tmp/svt-av1/Build && \
+  cmake .. -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=Release && \
+  make && make install
+RUN \
+  echo "**** grabbing theora ****" && \
+  mkdir -p /tmp/theora && \
+  curl -Lf \
+    http://downloads.xiph.org/releases/theora/libtheora-${THEORA}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/theora
+RUN \
+  echo "**** compiling theora ****" && \
+  cd /tmp/theora && \
+  ./configure --disable-static --enable-shared && \
+  make && make install
+RUN \
+  echo "**** grabbing vorbis ****" && \
+  mkdir -p /tmp/vorbis && \
+  curl -Lf \
+    http://downloads.xiph.org/releases/vorbis/libvorbis-${VORBIS}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/vorbis
+RUN \
+  echo "**** compiling vorbis ****" && \
+  cd /tmp/vorbis && \
+  ./configure --disable-static --enable-shared && \
+  make && make install
+RUN \
+  echo "**** grabbing vpx ****" && \
+  mkdir -p /tmp/vpx && \
+  curl -Lf \
+    https://github.com/webmproject/libvpx/archive/v${VPX}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/vpx
+RUN \
+  echo "**** compiling vpx ****" && \
+  cd /tmp/vpx && \
+  ./configure \
+    --disable-debug --disable-docs --disable-examples \
+    --disable-install-bins --disable-static --disable-unit-tests \
+    --enable-pic --enable-shared \
+    --enable-vp8 --enable-vp9 --enable-vp9-highbitdepth && \
+  make && make install
+RUN \
+  echo "**** grabbing webp ****" && \
+  mkdir -p /tmp/webp && \
+  curl -Lf \
+    https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${WEBP}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/webp
+RUN \
+  echo "**** compiling webp ****" && \
+  cd /tmp/webp && \
+  ./configure && make && make install && \
+  strip -d /usr/local/lib/libweb*.so
+RUN \
+  echo "**** grabbing x264 ****" && \
+  mkdir -p /tmp/x264 && \
+  curl -Lf \
+    https://code.videolan.org/videolan/x264/-/archive/master/x264-stable.tar.bz2 | \
+    tar -jx --strip-components=1 -C /tmp/x264
+RUN \
+  echo "**** compiling x264 ****" && \
+  cd /tmp/x264 && \
+  ./configure \
+    --disable-cli --disable-static \
+    --enable-pic --enable-shared && \
+  make && make install
+RUN \
+  echo "**** grabbing x265 ****" && \
+  mkdir -p /tmp/x265 && \
+  curl -Lf \
+    https://bitbucket.org/multicoreware/x265_git/downloads/x265_${X265}.tar.gz | \
+    tar -zx --strip-components=1 -C /tmp/x265
+# Focal's default gcc-9 doesn't recognize the "i8mm" ARMv8.2 feature
+# modifier that x265's own build-time CPU-feature probe detects and enables
+# on this Neon-DotProd/I8MM-capable CPU; gcc-10 (in Focal's own repos, no PPA
+# needed) does. Only x265 needs this - everything else built fine on gcc-9.
+RUN \
+  echo "**** installing gcc-10 for x265 (i8mm support) ****" && \
+  apt-get install -y gcc-10 g++-10
+# multilib.sh's own cmake invocations, expanded inline with SVE/SVE2/
+# SVE2-BitPerm forced off: x265's aarch64 build-time probe reports them as
+# available (compile-test success, not an actual runtime hardware check),
+# but this Xavier-class Jetson's Carmel CPU cores are ARMv8.2 and have no
+# real SVE/SVE2 silicon - and the SVE2-BitPerm codepath needs -march=armv9-a,
+# which not even gcc-10 recognizes. Neon (+DotProd/+I8MM) still applies.
+RUN \
+  echo "**** compiling x265 ****" && \
+  cd /tmp/x265/build/linux && \
+  export CC=gcc-10 && \
+  export CXX=g++-10 && \
+  export CXXFLAGS="-fPIC" && \
+  SVE_FLAGS="-DENABLE_SVE=OFF -DENABLE_SVE2=OFF -DENABLE_SVE2_BITPERM=OFF" && \
+  mkdir -p 8bit 10bit 12bit && \
+  cd 12bit && \
+  cmake ../../../source -DHIGH_BIT_DEPTH=ON -DEXPORT_C_API=OFF -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DMAIN12=ON ${SVE_FLAGS} && \
+  make && \
+  cd ../10bit && \
+  cmake ../../../source -DHIGH_BIT_DEPTH=ON -DEXPORT_C_API=OFF -DENABLE_SHARED=OFF -DENABLE_CLI=OFF ${SVE_FLAGS} && \
+  make && \
+  cd ../8bit && \
+  ln -sf ../10bit/libx265.a libx265_main10.a && \
+  ln -sf ../12bit/libx265.a libx265_main12.a && \
+  cmake ../../../source -DEXTRA_LIB="x265_main10.a;x265_main12.a" -DEXTRA_LINK_FLAGS=-L. -DLINKED_10BIT=ON -DLINKED_12BIT=ON ${SVE_FLAGS} && \
+  make && \
+  mv libx265.a libx265_main.a && \
+  printf 'CREATE libx265.a\nADDLIB libx265_main.a\nADDLIB libx265_main10.a\nADDLIB libx265_main12.a\nSAVE\nEND\n' | ar -M
+RUN \
+  cd /tmp/x265/build/linux/8bit && \
+  make install
+RUN \
+  echo "**** grabbing zimg ****" && \
+  mkdir -p /tmp/zimg && \
+  git clone --branch release-${ZIMG} --depth 1 \
+    https://github.com/sekrit-twc/zimg.git /tmp/zimg
+RUN \
+  echo "**** compiling zimg ****" && \
+  cd /tmp/zimg && \
+  ./autogen.sh && \
+  ./configure --disable-static --enable-shared && \
+  make && make install
+
+# --- jetson-ffmpeg: libnvmpi + nvmpi patch ---
+# Jetson Multimedia API sample sources + Tegra libs, populated into the build
+# context by scripts/prepare-jetson-mmapi.sh (copied from this exact host's
+# /usr/src/jetson_multimedia_api and /usr/lib/aarch64-linux-gnu/tegra, since
+# they are L4T-BSP-specific and not available from any package repo).
+COPY jetson-mmapi/jetson_multimedia_api /usr/src/jetson_multimedia_api
+COPY jetson-mmapi/tegra-libs /usr/lib/aarch64-linux-gnu/tegra
+
+RUN \
+  echo "**** grabbing jetson-ffmpeg (nvmpi) ****" && \
+  git clone --depth 1 https://github.com/gjrtimmer/jetson-ffmpeg.git /tmp/jetson-ffmpeg
+RUN \
+  echo "**** compiling libnvmpi ****" && \
+  cd /tmp/jetson-ffmpeg && \
+  mkdir -p build && cd build && \
+  cmake -DJETSON_MULTIMEDIA_API_DIR=/usr/src/jetson_multimedia_api \
+        -DJETSON_MULTIMEDIA_LIB_DIR=/usr/lib/aarch64-linux-gnu/tegra \
+        .. && \
+  make nvmpi nvmpi_static -j$(nproc) && \
+  cmake --install . && \
+  ldconfig
+
+# main ffmpeg build
+RUN \
+  echo "**** grabbing ffmpeg ****" && \
+  git clone --depth 1 --branch ${FFMPEG_HARD} \
+    git://source.ffmpeg.org/ffmpeg.git /tmp/ffmpeg
+
+RUN \
+  echo "**** patching ffmpeg for nvmpi ****" && \
+  cd /tmp/jetson-ffmpeg && \
+  ./scripts/ffpatch.sh /tmp/ffmpeg
+
+RUN \
+  echo "**** compiling ffmpeg ****" && \
+  cd /tmp/ffmpeg && \
+  PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:${PKG_CONFIG_PATH}" \
+  ./configure \
+    --disable-debug \
+    --disable-doc \
+    --disable-ffplay \
+    --enable-alsa \
+    --enable-ffprobe \
+    --enable-gpl \
+    --enable-libass \
+    --enable-libdav1d \
+    --enable-libfdk_aac \
+    --enable-libfontconfig \
+    --enable-libfreetype \
+    --enable-libfribidi \
+    --enable-libharfbuzz \
+    --enable-libmp3lame \
+    --enable-libopus \
+    --enable-libsvtav1 \
+    --enable-libtheora \
+    --enable-libv4l2 \
+    --enable-libvorbis \
+    --enable-libvpx \
+    --enable-libwebp \
+    --enable-libx264 \
+    --enable-libx265 \
+    --enable-libxml2 \
+    --enable-libzimg \
+    --enable-nonfree \
+    --enable-nvmpi \
+    --enable-openssl \
+    --enable-stripping \
+    --enable-version3 \
+    --extra-cflags="-DHAVE_VISIBILITY=1" \
+    && \
+  make -j$(nproc)
+
+RUN \
+  echo "**** arrange files ****" && \
+  ldconfig && \
+  mkdir -p \
+    /buildout/usr/local/bin \
+    /buildout/usr/local/etc/fonts \
+    /buildout/usr/local/lib/aarch64-linux-gnu \
+    /buildout/usr/lib/aarch64-linux-gnu/tegra \
+    /buildout/usr/share/fonts && \
+  cp /tmp/ffmpeg/ffmpeg /buildout/usr/local/bin && \
+  cp /tmp/ffmpeg/ffprobe /buildout/usr/local/bin && \
+  cp -a /usr/local/etc/fonts/* /buildout/usr/local/etc/fonts/ && \
+  cp -a /usr/local/lib/lib*so* /buildout/usr/local/lib/ && \
+  cp -a /usr/local/lib/aarch64-linux-gnu/lib*so* /buildout/usr/local/lib/aarch64-linux-gnu/ && \
+  cp -a /usr/lib/aarch64-linux-gnu/tegra/lib*so* /buildout/usr/lib/aarch64-linux-gnu/tegra/ && \
+  cp -a /usr/share/fonts/* /buildout/usr/share/fonts/
+
+# runtime stage
+FROM ghcr.io/linuxserver/baseimage-ubuntu:arm64v8-focal
+
+COPY --from=buildstage /buildout/ /
+
+# The Tegra libs baked in under /usr/lib/aarch64-linux-gnu/tegra aren't on
+# the default dynamic linker search path (that's not a path ldconfig scans
+# by default), so libnvmpi.so can't resolve them without this at runtime.
+ENV LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/tegra"
+
+ARG BUILD_DATE
+ARG VERSION
+LABEL build_version="jetson-ffmpeg (nvmpi) build_version:- ${VERSION} Build-date:- ${BUILD_DATE}"
+LABEL maintainer="phongphuhanam"
+
+ARG DEBIAN_FRONTEND="noninteractive"
+
+RUN \
+  echo "**** install runtime ****" && \
+  apt-get update && \
+  apt-get install -y \
+    libasound2 \
+    libbsd0 \
+    libegl1 \
+    libexpat1 \
+    libglib2.0-0 \
+    libgomp1 \
+    libicu66 \
+    libjpeg-turbo8 \
+    liblzma5 \
+    libpcre3 \
+    libpng16-16 \
+    libssl1.1 \
+    libv4l-0 \
+    libx11-6 \
+    libxcb1 \
+    libxcb-shm0 \
+    libxext6 \
+    libxml2 && \
+  rm -rf /var/lib/apt/lists/* /var/tmp/* && \
+  echo "**** quick test ffmpeg (nvmpi codecs won't run until Tegra devices are mounted at container run time) ****" && \
+  ldd /usr/local/bin/ffmpeg && \
+  /usr/local/bin/ffmpeg -version
+
+ENTRYPOINT ["/usr/local/bin/ffmpeg"]
