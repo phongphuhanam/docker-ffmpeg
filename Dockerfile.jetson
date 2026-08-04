@@ -426,11 +426,9 @@ RUN \
     --enable-libwebp \
     --enable-libx264 \
     --enable-libx265 \
-    --enable-libxml2 \
     --enable-libzimg \
     --enable-nonfree \
     --enable-nvmpi \
-    --enable-openssl \
     --enable-stripping \
     --enable-version3 \
     --extra-cflags="-DHAVE_VISIBILITY=1" \
@@ -444,14 +442,17 @@ RUN \
     /buildout/usr/local/bin \
     /buildout/usr/local/etc/fonts \
     /buildout/usr/local/lib/aarch64-linux-gnu \
-    /buildout/usr/lib/aarch64-linux-gnu/tegra \
-    /buildout/usr/share/fonts && \
+    /buildout/usr/lib/aarch64-linux-gnu/tegra && \
   cp /tmp/ffmpeg/ffmpeg /buildout/usr/local/bin && \
   cp /tmp/ffmpeg/ffprobe /buildout/usr/local/bin && \
   cp -a /usr/local/etc/fonts/* /buildout/usr/local/etc/fonts/ && \
   cp -a /usr/local/lib/lib*so* /buildout/usr/local/lib/ && \
-  cp -a /usr/local/lib/aarch64-linux-gnu/lib*so* /buildout/usr/local/lib/aarch64-linux-gnu/ && \
-  cp -a /usr/share/fonts/* /buildout/usr/share/fonts/
+  cp -a /usr/local/lib/aarch64-linux-gnu/lib*so* /buildout/usr/local/lib/aarch64-linux-gnu/
+# Deliberately NOT bundling /usr/share/fonts (DejaVu) here: those files belong
+# to the fonts-dejavu-core package, which is already present on jellyfin's
+# base image (and common on Debian/Ubuntu targets generally). Shipping our
+# own copies at the same path makes dpkg refuse to install ("trying to
+# overwrite ... which is also in package fonts-dejavu-core").
 # Deliberately NOT bundling /usr/lib/aarch64-linux-gnu/tegra/*.so here: those
 # are proprietary Tegra libs (libcuda, libnvbufsurface, libnvjpeg, ...) that
 # nvidia-container-runtime's own CSV-driven injection (host-files-for-

@@ -3,3 +3,6 @@
 # Host-specific L4T/Jetson Multimedia API + proprietary Tegra libs,
 # populated by scripts/prepare-jetson-mmapi.sh - not redistributable
 jetson-mmapi/
+
+# Built .deb packages - build artifacts, not source
+*.deb

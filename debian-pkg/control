@@ -3,7 +3,7 @@ Version: 7.1-nvmpi
 Section: video
 Priority: optional
 Architecture: arm64
-Depends: libasound2, libbsd0, libegl1, libexpat1, libglib2.0-0, libgomp1, libicu66, libjpeg-turbo8, liblzma5, libpcre3, libpng16-16, libssl1.1, libv4l-0, libx11-6, libxcb1, libxcb-shm0, libxext6, libxml2
+Depends: libasound2, libbsd0, libegl1, libexpat1, libglib2.0-0, libgomp1, libjpeg-turbo8, liblzma5, libpng16-16, libv4l-0 | libv4l-0t64, libx11-6, libxcb1, libxcb-shm0, libxext6
 Maintainer: phongphuhanam
 Description: FFmpeg (jellyfin-ffmpeg equivalent) with jetson-ffmpeg nvmpi
  hardware-accelerated H.264/HEVC encode+decode for Jetson/Tegra devices.
